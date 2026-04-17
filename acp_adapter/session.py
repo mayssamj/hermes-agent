@@ -13,6 +13,7 @@ from hermes_constants import get_hermes_home
 import copy
 import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from threading import Lock
@@ -442,20 +443,32 @@ class SessionManager:
             "model": model or default_model,
         }
 
-        try:
-            runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+        config_base_url = model_cfg.get("base_url") if isinstance(model_cfg, dict) else None
+        config_api_key = model_cfg.get("api_key") if isinstance(model_cfg, dict) else None
+        if config_provider == "custom" and config_base_url:
             kwargs.update(
                 {
-                    "provider": runtime.get("provider"),
-                    "api_mode": api_mode or runtime.get("api_mode"),
-                    "base_url": base_url or runtime.get("base_url"),
-                    "api_key": runtime.get("api_key"),
-                    "command": runtime.get("command"),
-                    "args": list(runtime.get("args") or []),
+                    "provider": config_provider,
+                    "api_mode": api_mode or "chat_completions",
+                    "base_url": base_url or config_base_url,
+                    "api_key": os.environ.get("LITELLM_MASTER_KEY", "") if config_api_key and config_api_key.startswith("${") else (config_api_key or ""),
                 }
             )
-        except Exception:
-            logger.debug("ACP session falling back to default provider resolution", exc_info=True)
+        else:
+            try:
+                runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+                kwargs.update(
+                    {
+                        "provider": runtime.get("provider"),
+                        "api_mode": api_mode or runtime.get("api_mode"),
+                        "base_url": base_url or runtime.get("base_url"),
+                        "api_key": runtime.get("api_key"),
+                        "command": runtime.get("command"),
+                        "args": list(runtime.get("args") or []),
+                    }
+                )
+            except Exception:
+                logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 
         _register_task_cwd(session_id, cwd)
         return AIAgent(**kwargs)
