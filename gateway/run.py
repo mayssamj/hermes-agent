@@ -7884,6 +7884,28 @@ class GatewayRunner:
             with _lock:
                 self._agent_cache.pop(session_key, None)
 
+    def _release_evicted_agent_soft(self, agent: Any) -> None:
+        """Soft cleanup for cache-evicted agents — preserves session tool state.
+
+        Called from _enforce_agent_cache_cap and _sweep_idle_cached_agents.
+        Distinct from _cleanup_agent_resources (full teardown) because a
+        cache-evicted session may resume at any time — its terminal
+        sandbox, browser daemon, and tracked bg processes must outlive
+        the Python AIAgent instance so the next agent built for the
+        same task_id inherits them.
+        """
+        if agent is None:
+            return
+        try:
+            if hasattr(agent, "release_clients"):
+                agent.release_clients()
+            else:
+                # Older agent instance (shouldn't happen in practice) —
+                # fall back to the legacy full-close path.
+                self._cleanup_agent_resources(agent)
+        except Exception:
+            pass
+
     def _enforce_agent_cache_cap(self) -> None:
         """Evict oldest cached agents when cache exceeds _AGENT_CACHE_MAX_SIZE.
 
@@ -7954,7 +7976,7 @@ class GatewayRunner:
             )
             if agent is not None:
                 threading.Thread(
-                    target=self._cleanup_agent_resources,
+                    target=self._release_evicted_agent_soft,
                     args=(agent,),
                     daemon=True,
                     name=f"agent-cache-evict-{key[:24]}",
@@ -8002,7 +8024,7 @@ class GatewayRunner:
                 key, now - getattr(agent, "_last_activity_ts", now),
             )
             threading.Thread(
-                target=self._cleanup_agent_resources,
+                target=self._release_evicted_agent_soft,
                 args=(agent,),
                 daemon=True,
                 name=f"agent-cache-idle-{key[:24]}",

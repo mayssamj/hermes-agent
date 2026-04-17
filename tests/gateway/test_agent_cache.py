@@ -326,13 +326,23 @@ class TestAgentCacheBoundedGrowth:
         assert "s3" in runner._agent_cache
 
     def test_cap_triggers_cleanup_thread(self, monkeypatch):
-        """Evicted agent has _cleanup_agent_resources called for it."""
+        """Evicted agent has release_clients() called for it (soft cleanup).
+
+        Uses the soft path (_release_evicted_agent_soft), NOT the hard
+        _cleanup_agent_resources — cache eviction must not tear down
+        per-task state (terminal/browser/bg procs).
+        """
         from gateway import run as gw_run
 
         monkeypatch.setattr(gw_run, "_AGENT_CACHE_MAX_SIZE", 1)
         runner = self._bounded_runner()
 
+        release_calls: list = []
         cleanup_calls: list = []
+        # Intercept both paths; only release_clients path should fire.
+        def _soft(agent):
+            release_calls.append(agent)
+        runner._release_evicted_agent_soft = _soft
         runner._cleanup_agent_resources = lambda a: cleanup_calls.append(a)
 
         old_agent = self._fake_agent()
@@ -345,10 +355,12 @@ class TestAgentCacheBoundedGrowth:
         # Cleanup is dispatched to a daemon thread; join briefly to observe.
         import time as _t
         deadline = _t.time() + 2.0
-        while _t.time() < deadline and not cleanup_calls:
+        while _t.time() < deadline and not release_calls:
             _t.sleep(0.02)
-        assert old_agent in cleanup_calls
-        assert new_agent not in cleanup_calls
+        assert old_agent in release_calls
+        assert new_agent not in release_calls
+        # Hard-cleanup path must NOT have fired — that's for session expiry only.
+        assert cleanup_calls == []
 
     def test_idle_ttl_sweep_evicts_stale_agents(self, monkeypatch):
         """_sweep_idle_cached_agents removes agents idle past the TTL."""
@@ -817,3 +829,214 @@ class TestAgentCacheSpilloverLive:
                 a.close()
             except Exception:
                 pass
+
+
+class TestAgentCacheIdleResume:
+    """End-to-end: idle-TTL-evicted session resumes cleanly with task state.
+
+    Real-world scenario: user leaves a Telegram session open for 2+ hours.
+    Idle-TTL evicts their cached agent.  They come back and send a message.
+    The new agent built for the same session_id must inherit:
+      - Conversation history (from SessionStore — outside cache concern)
+      - Terminal sandbox (same task_id → same _active_environments entry)
+      - Browser daemon (same task_id → same browser session)
+      - Background processes (same task_id → same process_registry entries)
+    The ONLY thing that should reset is the LLM client pool (rebuilt fresh).
+    """
+
+    def _runner(self):
+        from collections import OrderedDict
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._agent_cache = OrderedDict()
+        runner._agent_cache_lock = threading.Lock()
+        runner._running_agents = {}
+        return runner
+
+    def test_release_clients_does_not_touch_process_registry(self, monkeypatch):
+        """release_clients must not call process_registry.kill_all for task_id."""
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            model="anthropic/claude-sonnet-4", api_key="test",
+            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            max_iterations=5, quiet_mode=True,
+            skip_context_files=True, skip_memory=True,
+            session_id="idle-resume-test-session",
+        )
+
+        # Spy on process_registry.kill_all — it MUST NOT be called.
+        from tools import process_registry as _pr
+        kill_all_calls: list = []
+        original_kill_all = _pr.process_registry.kill_all
+        _pr.process_registry.kill_all = lambda **kw: kill_all_calls.append(kw)
+        try:
+            agent.release_clients()
+        finally:
+            _pr.process_registry.kill_all = original_kill_all
+            try:
+                agent.close()
+            except Exception:
+                pass
+
+        assert kill_all_calls == [], (
+            f"release_clients() called process_registry.kill_all — would "
+            f"kill user's bg processes on cache eviction. Calls: {kill_all_calls}"
+        )
+
+    def test_release_clients_does_not_touch_terminal_or_browser(self, monkeypatch):
+        """release_clients must not call cleanup_vm or cleanup_browser."""
+        from run_agent import AIAgent
+        from tools import terminal_tool as _tt
+        from tools import browser_tool as _bt
+
+        agent = AIAgent(
+            model="anthropic/claude-sonnet-4", api_key="test",
+            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            max_iterations=5, quiet_mode=True,
+            skip_context_files=True, skip_memory=True,
+            session_id="idle-resume-test-2",
+        )
+
+        vm_calls: list = []
+        browser_calls: list = []
+        original_vm = _tt.cleanup_vm
+        original_browser = _bt.cleanup_browser
+        _tt.cleanup_vm = lambda tid: vm_calls.append(tid)
+        _bt.cleanup_browser = lambda tid: browser_calls.append(tid)
+        try:
+            agent.release_clients()
+        finally:
+            _tt.cleanup_vm = original_vm
+            _bt.cleanup_browser = original_browser
+            try:
+                agent.close()
+            except Exception:
+                pass
+
+        assert vm_calls == [], (
+            f"release_clients() tore down terminal sandbox — user's cwd, "
+            f"env, and bg shells would be gone on resume. Calls: {vm_calls}"
+        )
+        assert browser_calls == [], (
+            f"release_clients() tore down browser session — user's open "
+            f"tabs and cookies gone on resume. Calls: {browser_calls}"
+        )
+
+    def test_release_clients_closes_llm_client(self):
+        """release_clients IS expected to close the OpenAI/httpx client."""
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            model="anthropic/claude-sonnet-4", api_key="test",
+            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            max_iterations=5, quiet_mode=True,
+            skip_context_files=True, skip_memory=True,
+        )
+        # Clients are lazy-built; force one to exist so we can verify close.
+        assert agent.client is not None  # __init__ builds it
+
+        agent.release_clients()
+
+        # Post-release: client reference is dropped (memory freed).
+        assert agent.client is None
+
+    def test_close_vs_release_full_teardown_difference(self, monkeypatch):
+        """close() tears down task state; release_clients() does not.
+
+        This pins the semantic contract: session-expiry path uses close()
+        (full teardown — session is done), cache-eviction path uses
+        release_clients() (soft — session may resume).
+        """
+        from run_agent import AIAgent
+        from tools import terminal_tool as _tt
+
+        # Agent A: evicted from cache (soft) — terminal survives.
+        # Agent B: session expired (hard) — terminal torn down.
+        agent_a = AIAgent(
+            model="anthropic/claude-sonnet-4", api_key="test",
+            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            max_iterations=5, quiet_mode=True,
+            skip_context_files=True, skip_memory=True,
+            session_id="soft-session",
+        )
+        agent_b = AIAgent(
+            model="anthropic/claude-sonnet-4", api_key="test",
+            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            max_iterations=5, quiet_mode=True,
+            skip_context_files=True, skip_memory=True,
+            session_id="hard-session",
+        )
+
+        vm_calls: list = []
+        original_vm = _tt.cleanup_vm
+        _tt.cleanup_vm = lambda tid: vm_calls.append(tid)
+        try:
+            agent_a.release_clients()   # cache eviction
+            agent_b.close()              # session expiry
+        finally:
+            _tt.cleanup_vm = original_vm
+            try:
+                agent_a.close()
+            except Exception:
+                pass
+
+        # Only agent_b's task_id should appear in cleanup calls.
+        assert "hard-session" in vm_calls
+        assert "soft-session" not in vm_calls
+
+    def test_idle_evicted_session_rebuild_inherits_task_id(self, monkeypatch):
+        """After idle-TTL eviction, a fresh agent with the same session_id
+        gets the same task_id — so tool state (terminal/browser/bg procs)
+        that persisted across eviction is reachable via the new agent.
+        """
+        from gateway import run as gw_run
+        from run_agent import AIAgent
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_IDLE_TTL_SECS", 0.01)
+        runner = self._runner()
+
+        # Build an agent representing a stale (idle) session.
+        SESSION_ID = "long-lived-user-session"
+        old = AIAgent(
+            model="anthropic/claude-sonnet-4", api_key="test",
+            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            max_iterations=5, quiet_mode=True,
+            skip_context_files=True, skip_memory=True,
+            session_id=SESSION_ID,
+        )
+        old._last_activity_ts = 0.0  # force idle
+        runner._agent_cache["sKey"] = (old, "sig")
+
+        # Simulate the idle-TTL sweep firing.
+        runner._sweep_idle_cached_agents()
+        assert "sKey" not in runner._agent_cache
+
+        # Wait for the daemon thread doing release_clients() to finish.
+        import time as _t
+        _t.sleep(0.3)
+
+        # Old agent's client is gone (soft cleanup fired).
+        assert old.client is None
+
+        # User comes back — new agent built for the SAME session_id.
+        new_agent = AIAgent(
+            model="anthropic/claude-sonnet-4", api_key="test",
+            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            max_iterations=5, quiet_mode=True,
+            skip_context_files=True, skip_memory=True,
+            session_id=SESSION_ID,
+        )
+
+        # Same session_id means same task_id routed to tools.  The new
+        # agent inherits any per-task state (terminal sandbox etc.) that
+        # was preserved across eviction.
+        assert new_agent.session_id == old.session_id == SESSION_ID
+        # And it has a fresh working client.
+        assert new_agent.client is not None
+
+        try:
+            new_agent.close()
+        except Exception:
+            pass
