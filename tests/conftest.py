@@ -5,8 +5,11 @@ Hermetic-test invariants enforced here (see AGENTS.md for rationale):
 1. **No credential env vars.** All provider/credential-shaped env vars
    (ending in _API_KEY, _TOKEN, _SECRET, _PASSWORD, _CREDENTIALS, etc.)
    are unset before every test. Local developer keys cannot leak in.
-2. **Isolated HOME.** Both HOME and HERMES_HOME point to a per-test
-   tempdir so code reading ``~/.hermes/*`` can't see the real one.
+2. **Isolated HERMES_HOME.** HERMES_HOME points to a per-test tempdir so
+   code reading ``~/.hermes/*`` via ``get_hermes_home()`` can't see the
+   real one. (We do NOT also redirect HOME — that broke subprocesses in
+   CI. Code using ``Path.home() / ".hermes"`` instead of the canonical
+   ``get_hermes_home()`` is a bug to fix at the callsite.)
 3. **Deterministic runtime.** TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0.
 4. **No HERMES_SESSION_* inheritance** — the agent's current gateway
    session must not leak into tests.
@@ -201,8 +204,16 @@ def _hermetic_environment(tmp_path, monkeypatch):
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
 
-    # 3. Redirect HOME and HERMES_HOME to per-test tempdirs. Some code
-    #    constructs ``~/.hermes/*`` directly — isolating HOME protects us.
+    # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
+    #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
+    #
+    #    NOTE: We do NOT also redirect HOME. Doing so broke CI because
+    #    some tests (and their transitive deps) spawn subprocesses that
+    #    inherit HOME and expect it to be stable. If a test genuinely
+    #    needs HOME isolated, it should set it explicitly in its own
+    #    fixture. Any code in the codebase reading ``~/.hermes/*`` via
+    #    ``Path.home() / ".hermes"`` instead of ``get_hermes_home()``
+    #    is a bug to fix at the callsite.
     fake_hermes_home = tmp_path / "hermes_test"
     fake_hermes_home.mkdir()
     (fake_hermes_home / "sessions").mkdir()
@@ -210,10 +221,6 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
-
-    fake_home = tmp_path / "fake_home"
-    fake_home.mkdir()
-    monkeypatch.setenv("HOME", str(fake_home))
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
