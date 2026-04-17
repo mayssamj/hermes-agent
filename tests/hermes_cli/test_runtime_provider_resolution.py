@@ -119,6 +119,11 @@ def test_resolve_runtime_provider_falls_back_when_pool_empty(monkeypatch):
 
 
 def test_resolve_runtime_provider_codex(monkeypatch):
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda provider: type("P", (), {"has_credentials": lambda self: False})(),
+    )
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
     monkeypatch.setattr(
         rp,
@@ -141,6 +146,82 @@ def test_resolve_runtime_provider_codex(monkeypatch):
     assert resolved["base_url"] == "https://chatgpt.com/backend-api/codex"
     assert resolved["api_key"] == "codex-token"
     assert resolved["requested_provider"] == "openai-codex"
+
+
+def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    monkeypatch.setattr(
+        rp,
+        "resolve_qwen_runtime_credentials",
+        lambda: {
+            "provider": "qwen-oauth",
+            "base_url": "https://portal.qwen.ai/v1",
+            "api_key": "qwen-token",
+            "source": "qwen-cli",
+            "expires_at_ms": 1775640710946,
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="qwen-oauth")
+
+    assert resolved["provider"] == "qwen-oauth"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "https://portal.qwen.ai/v1"
+    assert resolved["api_key"] == "qwen-token"
+    assert resolved["requested_provider"] == "qwen-oauth"
+
+
+def test_resolve_runtime_provider_uses_qwen_pool_entry(monkeypatch):
+    class _Entry:
+        access_token = "pool-qwen-token"
+        source = "manual:qwen_cli"
+        base_url = "https://portal.qwen.ai/v1"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "qwen-oauth", "default": "coder-model"})
+
+    resolved = rp.resolve_runtime_provider(requested="qwen-oauth")
+
+    assert resolved["provider"] == "qwen-oauth"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "https://portal.qwen.ai/v1"
+    assert resolved["api_key"] == "pool-qwen-token"
+    assert resolved["source"] == "manual:qwen_cli"
+
+
+def test_resolve_provider_alias_qwen(monkeypatch):
+    monkeypatch.setattr(rp.auth_mod, "_load_auth_store", lambda: {})
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    assert rp.resolve_provider("qwen-portal") == "qwen-oauth"
+    assert rp.resolve_provider("qwen-cli") == "qwen-oauth"
+
+
+def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
+    """When requested_provider is 'auto' and Qwen creds fail, fall through."""
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    monkeypatch.setattr(
+        rp,
+        "resolve_qwen_runtime_credentials",
+        lambda **kw: (_ for _ in ()).throw(AuthError("stale", provider="qwen-oauth", code="qwen_auth_missing")),
+    )
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
+
+    # Should NOT raise — falls through to OpenRouter
+    resolved = rp.resolve_runtime_provider(requested="auto")
+    # The fallthrough means it won't be qwen-oauth
+    assert resolved["provider"] != "qwen-oauth"
 
 
 def test_resolve_runtime_provider_ai_gateway(monkeypatch):
@@ -489,6 +570,87 @@ def test_named_custom_provider_uses_saved_credentials(monkeypatch):
     assert resolved["api_key"] == "local-provider-key"
     assert resolved["requested_provider"] == "local"
     assert resolved["source"] == "custom_provider:Local"
+
+
+def test_named_custom_provider_uses_providers_dict_when_list_missing(monkeypatch):
+    """After v11→v12 migration deletes custom_providers, resolution should
+    still find entries in the providers dict via get_compatible_custom_providers."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "openai-direct-primary": {
+                    "api": "https://api.openai.com/v1",
+                    "api_key": "dir-key",
+                    "default_model": "gpt-5-mini",
+                    "name": "OpenAI Direct (Primary)",
+                    "transport": "codex_responses",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError(
+                "resolve_provider should not be called for named custom providers"
+            )
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-direct-primary")
+
+    assert resolved["provider"] == "custom"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == "https://api.openai.com/v1"
+    assert resolved["api_key"] == "dir-key"
+    assert resolved["requested_provider"] == "openai-direct-primary"
+    assert resolved["source"] == "custom_provider:OpenAI Direct (Primary)"
+    assert resolved["model"] == "gpt-5-mini"
+
+
+def test_named_custom_provider_uses_key_env_from_providers_dict(monkeypatch):
+    """providers dict entries with key_env should resolve API key from env var."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("MYCORP_API_KEY", "env-secret")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "mycorp-proxy": {
+                    "base_url": "https://proxy.example.com/v1",
+                    "default_model": "acme-large",
+                    "key_env": "MYCORP_API_KEY",
+                    "name": "MyCorp Proxy",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError(
+                "resolve_provider should not be called for named custom providers"
+            )
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="mycorp-proxy")
+
+    assert resolved["provider"] == "custom"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "https://proxy.example.com/v1"
+    assert resolved["api_key"] == "env-secret"
+    assert resolved["requested_provider"] == "mycorp-proxy"
+    assert resolved["source"] == "custom_provider:MyCorp Proxy"
+    assert resolved["model"] == "acme-large"
 
 
 def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
@@ -1138,3 +1300,115 @@ def test_openrouter_provider_not_affected_by_custom_fix(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="openrouter")
     assert resolved["provider"] == "openrouter"
+
+
+# ------------------------------------------------------------------
+# fix #7828 — custom_providers model field must propagate to runtime
+# ------------------------------------------------------------------
+
+
+def test_get_named_custom_provider_includes_model(monkeypatch):
+    """_get_named_custom_provider should include the model field from config."""
+    monkeypatch.setattr(rp, "load_config", lambda: {
+        "custom_providers": [{
+            "name": "my-dashscope",
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+            "model": "qwen3.6-plus",
+        }],
+    })
+
+    result = rp._get_named_custom_provider("my-dashscope")
+    assert result is not None
+    assert result["model"] == "qwen3.6-plus"
+
+
+def test_get_named_custom_provider_excludes_empty_model(monkeypatch):
+    """Empty or whitespace-only model field should not appear in result."""
+    for model_val in ["", "   ", None]:
+        entry = {
+            "name": "test-ep",
+            "base_url": "https://example.com/v1",
+            "api_key": "key",
+        }
+        if model_val is not None:
+            entry["model"] = model_val
+
+        monkeypatch.setattr(rp, "load_config", lambda e=entry: {
+            "custom_providers": [e],
+        })
+
+        result = rp._get_named_custom_provider("test-ep")
+        assert result is not None
+        assert "model" not in result, (
+            f"model field {model_val!r} should not be included in result"
+        )
+
+
+def test_named_custom_runtime_propagates_model_direct_path(monkeypatch):
+    """Model should propagate through the direct (non-pool) resolution path."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "my-server")
+    monkeypatch.setattr(
+        rp, "_get_named_custom_provider",
+        lambda p: {
+            "name": "my-server",
+            "base_url": "http://localhost:8000/v1",
+            "api_key": "test-key",
+            "model": "qwen3.6-plus",
+        },
+    )
+    # Ensure pool doesn't intercept
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+
+    resolved = rp.resolve_runtime_provider(requested="my-server")
+    assert resolved["model"] == "qwen3.6-plus"
+    assert resolved["provider"] == "custom"
+
+
+def test_named_custom_runtime_propagates_model_pool_path(monkeypatch):
+    """Model should propagate even when credential pool handles credentials."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "my-server")
+    monkeypatch.setattr(
+        rp, "_get_named_custom_provider",
+        lambda p: {
+            "name": "my-server",
+            "base_url": "http://localhost:8000/v1",
+            "api_key": "test-key",
+            "model": "qwen3.6-plus",
+        },
+    )
+    # Pool returns a result (intercepting the normal path)
+    monkeypatch.setattr(
+        rp, "_try_resolve_from_custom_pool",
+        lambda *a, **k: {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": "http://localhost:8000/v1",
+            "api_key": "pool-key",
+            "source": "pool:custom:my-server",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="my-server")
+    assert resolved["model"] == "qwen3.6-plus", (
+        "model must be injected into pool result"
+    )
+    assert resolved["api_key"] == "pool-key", "pool credentials should be used"
+
+
+def test_named_custom_runtime_no_model_when_absent(monkeypatch):
+    """When custom_providers entry has no model field, runtime should not either."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "my-server")
+    monkeypatch.setattr(
+        rp, "_get_named_custom_provider",
+        lambda p: {
+            "name": "my-server",
+            "base_url": "http://localhost:8000/v1",
+            "api_key": "test-key",
+        },
+    )
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+
+    resolved = rp.resolve_runtime_provider(requested="my-server")
+    assert "model" not in resolved

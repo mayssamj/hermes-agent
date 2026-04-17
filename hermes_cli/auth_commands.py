@@ -32,29 +32,27 @@ from hermes_constants import OPENROUTER_BASE_URL
 
 
 # Providers that support OAuth login in addition to API keys.
-_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex"}
+_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "qwen-oauth"}
 
 
 def _get_custom_provider_names() -> list:
-    """Return list of (display_name, pool_key) tuples for custom_providers in config."""
+    """Return list of (display_name, pool_key, provider_key) tuples."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import get_compatible_custom_providers, load_config
 
         config = load_config()
     except Exception:
         return []
-    custom_providers = config.get("custom_providers")
-    if not isinstance(custom_providers, list):
-        return []
     result = []
-    for entry in custom_providers:
+    for entry in get_compatible_custom_providers(config):
         if not isinstance(entry, dict):
             continue
         name = entry.get("name")
         if not isinstance(name, str) or not name.strip():
             continue
         pool_key = f"{CUSTOM_POOL_PREFIX}{_normalize_custom_pool_name(name)}"
-        result.append((name.strip(), pool_key))
+        provider_key = str(entry.get("provider_key", "") or "").strip()
+        result.append((name.strip(), pool_key, provider_key))
     return result
 
 
@@ -66,8 +64,10 @@ def _resolve_custom_provider_input(raw: str) -> str | None:
     # Direct match on 'custom:name' format
     if normalized.startswith(CUSTOM_POOL_PREFIX):
         return normalized
-    for display_name, pool_key in _get_custom_provider_names():
+    for display_name, pool_key, provider_key in _get_custom_provider_names():
         if _normalize_custom_pool_name(display_name) == normalized:
+            return pool_key
+        if provider_key and provider_key.strip().lower() == normalized:
             return pool_key
     return None
 
@@ -147,7 +147,7 @@ def auth_add_command(args) -> None:
         if provider.startswith(CUSTOM_POOL_PREFIX):
             requested_type = AUTH_TYPE_API_KEY
         else:
-            requested_type = AUTH_TYPE_OAUTH if provider in {"anthropic", "nous", "openai-codex"} else AUTH_TYPE_API_KEY
+            requested_type = AUTH_TYPE_OAUTH if provider in {"anthropic", "nous", "openai-codex", "qwen-oauth"} else AUTH_TYPE_API_KEY
 
     pool = load_pool(provider)
 
@@ -250,6 +250,26 @@ def auth_add_command(args) -> None:
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 
+    if provider == "qwen-oauth":
+        creds = auth_mod.resolve_qwen_runtime_credentials(refresh_if_expiring=False)
+        label = (getattr(args, "label", None) or "").strip() or label_from_token(
+            creds["api_key"],
+            _oauth_default_label(provider, len(pool.entries()) + 1),
+        )
+        entry = PooledCredential(
+            provider=provider,
+            id=uuid.uuid4().hex[:6],
+            label=label,
+            auth_type=AUTH_TYPE_OAUTH,
+            priority=0,
+            source=f"{SOURCE_MANUAL}:qwen_cli",
+            access_token=creds["api_key"],
+            base_url=creds.get("base_url"),
+        )
+        pool.add_entry(entry)
+        print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
+        return
+
     raise SystemExit(f"`hermes auth add {provider}` is not implemented for auth type {requested_type} yet.")
 
 
@@ -327,8 +347,11 @@ def auth_remove_command(args) -> None:
             print("Cleared Hermes Anthropic OAuth credentials")
 
     elif removed.source == "claude_code" and provider == "anthropic":
-        print("Note: Claude Code credentials live in ~/.claude/.credentials.json")
-        print("      Remove them manually if you want to deauthorize Claude Code.")
+        from hermes_cli.auth import suppress_credential_source
+        suppress_credential_source(provider, "claude_code")
+        print("Suppressed claude_code credential — it will not be re-seeded.")
+        print("Note: Claude Code credentials still live in ~/.claude/.credentials.json")
+        print("Run `hermes auth add anthropic` to re-enable if needed.")
 
 
 def auth_reset_command(args) -> None:
@@ -382,7 +405,7 @@ def _pick_provider(prompt: str = "Provider") -> str:
     known = sorted(set(list(PROVIDER_REGISTRY.keys()) + ["openrouter"]))
     custom_names = _get_custom_provider_names()
     if custom_names:
-        custom_display = [name for name, _key in custom_names]
+        custom_display = [name for name, _key, _provider_key in custom_names]
         print(f"\nKnown providers: {', '.join(known)}")
         print(f"Custom endpoints: {', '.join(custom_display)}")
     else:
