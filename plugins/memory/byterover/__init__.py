@@ -23,16 +23,16 @@ import os
 import shutil
 import subprocess
 import threading
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
 # Timeouts
-_QUERY_TIMEOUT = 30   # brv query — should be fast
+_QUERY_TIMEOUT = 10   # brv query — should be fast
 _CURATE_TIMEOUT = 120  # brv curate — may involve LLM processing
 
 # Minimum lengths to filter noise
@@ -175,9 +175,6 @@ class ByteRoverMemoryProvider(MemoryProvider):
         self._cwd = ""
         self._session_id = ""
         self._turn_count = 0
-        self._prefetch_result = ""
-        self._prefetch_lock = threading.Lock()
-        self._prefetch_thread: Optional[threading.Thread] = None
         self._sync_thread: Optional[threading.Thread] = None
 
     @property
@@ -216,37 +213,26 @@ class ByteRoverMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=3.0)
-        with self._prefetch_lock:
-            result = self._prefetch_result
-            self._prefetch_result = ""
-        if not result:
+        """Run brv query synchronously before the agent's first LLM call.
+
+        Blocks until the query completes (up to _QUERY_TIMEOUT seconds), ensuring
+        the result is available as context before the model is called.
+        """
+        if not query or len(query.strip()) < _MIN_QUERY_LEN:
             return ""
-        return f"## ByteRover Context\n{result}"
+        result = _run_brv(
+            ["query", "--", query.strip()[:5000]],
+            timeout=_QUERY_TIMEOUT, cwd=self._cwd,
+        )
+        if result["success"] and result.get("output"):
+            output = result["output"].strip()
+            if len(output) > _MIN_OUTPUT_LEN:
+                return f"## ByteRover Context\n{output}"
+        return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        if not query or len(query.strip()) < _MIN_QUERY_LEN:
-            return
-
-        def _run():
-            try:
-                result = _run_brv(
-                    ["query", "--", query.strip()[:5000]],
-                    timeout=_QUERY_TIMEOUT, cwd=self._cwd,
-                )
-                if result["success"] and result.get("output"):
-                    output = result["output"].strip()
-                    if len(output) > _MIN_OUTPUT_LEN:
-                        with self._prefetch_lock:
-                            self._prefetch_result = output
-            except Exception as e:
-                logger.debug("ByteRover prefetch failed: %s", e)
-
-        self._prefetch_thread = threading.Thread(
-            target=_run, daemon=True, name="brv-prefetch"
-        )
-        self._prefetch_thread.start()
+        """No-op: prefetch() now runs synchronously at turn start."""
+        pass
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Curate the conversation turn in background (non-blocking)."""
@@ -335,19 +321,18 @@ class ByteRoverMemoryProvider(MemoryProvider):
             return self._tool_curate(args)
         elif tool_name == "brv_status":
             return self._tool_status()
-        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+        return tool_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
-        for t in (self._sync_thread, self._prefetch_thread):
-            if t and t.is_alive():
-                t.join(timeout=10.0)
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=10.0)
 
     # -- Tool implementations ------------------------------------------------
 
     def _tool_query(self, args: dict) -> str:
         query = args.get("query", "")
         if not query:
-            return json.dumps({"error": "query is required"})
+            return tool_error("query is required")
 
         result = _run_brv(
             ["query", "--", query.strip()[:5000]],
@@ -355,7 +340,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
         )
 
         if not result["success"]:
-            return json.dumps({"error": result.get("error", "Query failed")})
+            return tool_error(result.get("error", "Query failed"))
 
         output = result.get("output", "").strip()
         if not output or len(output) < _MIN_OUTPUT_LEN:
@@ -370,7 +355,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
     def _tool_curate(self, args: dict) -> str:
         content = args.get("content", "")
         if not content:
-            return json.dumps({"error": "content is required"})
+            return tool_error("content is required")
 
         result = _run_brv(
             ["curate", "--", content],
@@ -378,14 +363,14 @@ class ByteRoverMemoryProvider(MemoryProvider):
         )
 
         if not result["success"]:
-            return json.dumps({"error": result.get("error", "Curate failed")})
+            return tool_error(result.get("error", "Curate failed"))
 
         return json.dumps({"result": "Memory curated successfully."})
 
     def _tool_status(self) -> str:
         result = _run_brv(["status"], timeout=15, cwd=self._cwd)
         if not result["success"]:
-            return json.dumps({"error": result.get("error", "Status check failed")})
+            return tool_error(result.get("error", "Status check failed"))
         return json.dumps({"status": result.get("output", "")})
 
 

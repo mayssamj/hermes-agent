@@ -18,10 +18,10 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -144,10 +144,6 @@ class HonchoMemoryProvider(MemoryProvider):
         self._last_context_turn = -999
         self._last_dialectic_turn = -999
 
-        # B2: peer_memory_mode gating (stub)
-        self._suppress_memory = False
-        self._suppress_user_profile = False
-
         # Port #1957: lazy session init for tools-only mode
         self._session_initialized = False
         self._lazy_init_kwargs: Optional[dict] = None
@@ -187,8 +183,14 @@ class HonchoMemoryProvider(MemoryProvider):
     def get_config_schema(self):
         return [
             {"key": "api_key", "description": "Honcho API key", "secret": True, "env_var": "HONCHO_API_KEY", "url": "https://app.honcho.dev"},
-            {"key": "base_url", "description": "Honcho base URL", "default": "https://api.honcho.dev"},
+            {"key": "baseUrl", "description": "Honcho base URL (for self-hosted)"},
         ]
+
+    def post_setup(self, hermes_home: str, config: dict) -> None:
+        """Run the full Honcho setup wizard after provider selection."""
+        import types
+        from plugins.memory.honcho.cli import cmd_setup
+        cmd_setup(types.SimpleNamespace())
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Honcho session manager.
@@ -215,6 +217,12 @@ class HonchoMemoryProvider(MemoryProvider):
                 logger.debug("Honcho not configured — plugin inactive")
                 return
 
+            # Override peer_name with gateway user_id for per-user memory scoping.
+            # CLI sessions won't have user_id, so the config default is preserved.
+            _gw_user_id = kwargs.get("user_id")
+            if _gw_user_id:
+                cfg.peer_name = _gw_user_id
+
             self._config = cfg
 
             # ----- B1: recall_mode from config -----
@@ -233,48 +241,10 @@ class HonchoMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("Honcho cost-awareness config parse error: %s", e)
 
-            # ----- Port #1969: aiPeer sync from SOUL.md -----
-            try:
-                hermes_home = kwargs.get("hermes_home", "")
-                if hermes_home and not cfg.raw.get("aiPeer"):
-                    soul_path = Path(hermes_home) / "SOUL.md"
-                    if soul_path.exists():
-                        soul_text = soul_path.read_text(encoding="utf-8").strip()
-                        if soul_text:
-                            # Try YAML frontmatter: "name: Foo"
-                            first_line = soul_text.split("\n")[0].strip()
-                            if first_line.startswith("---"):
-                                # Look for name: in frontmatter
-                                for line in soul_text.split("\n")[1:]:
-                                    line = line.strip()
-                                    if line == "---":
-                                        break
-                                    if line.lower().startswith("name:"):
-                                        name_val = line.split(":", 1)[1].strip().strip("\"'")
-                                        if name_val:
-                                            cfg.ai_peer = name_val
-                                            logger.debug("Honcho ai_peer set from SOUL.md: %s", name_val)
-                                        break
-                            elif first_line.startswith("# "):
-                                # Markdown heading: "# AgentName"
-                                name_val = first_line[2:].strip()
-                                if name_val:
-                                    cfg.ai_peer = name_val
-                                    logger.debug("Honcho ai_peer set from SOUL.md heading: %s", name_val)
-            except Exception as e:
-                logger.debug("Honcho SOUL.md ai_peer sync failed: %s", e)
-
-            # ----- B2: peer_memory_mode gating (stub) -----
-            try:
-                ai_mode = cfg.peer_memory_mode(cfg.ai_peer)
-                user_mode = cfg.peer_memory_mode(cfg.peer_name or "user")
-                # "honcho" means Honcho owns memory; suppress built-in
-                self._suppress_memory = (ai_mode == "honcho")
-                self._suppress_user_profile = (user_mode == "honcho")
-                logger.debug("Honcho peer_memory_mode: ai=%s (suppress_memory=%s), user=%s (suppress_user_profile=%s)",
-                             ai_mode, self._suppress_memory, user_mode, self._suppress_user_profile)
-            except Exception as e:
-                logger.debug("Honcho peer_memory_mode check failed: %s", e)
+            # ----- Port #1969: aiPeer sync from SOUL.md — REMOVED -----
+            # SOUL.md is persona content, not identity config. aiPeer should
+            # only come from honcho.json (host block or root) or the default.
+            # See scratch/memory-plugin-ux-specs.md #10 for rationale.
 
             # ----- Port #1957: lazy session init for tools-only mode -----
             if self._recall_mode == "tools":
@@ -547,19 +517,71 @@ class HonchoMemoryProvider(MemoryProvider):
         """Track turn count for cadence and injection_frequency logic."""
         self._turn_count = turn_number
 
+    @staticmethod
+    def _chunk_message(content: str, limit: int) -> list[str]:
+        """Split content into chunks that fit within the Honcho message limit.
+
+        Splits at paragraph boundaries when possible, falling back to
+        sentence boundaries, then word boundaries. Each continuation
+        chunk is prefixed with "[continued] " so Honcho's representation
+        engine can reconstruct the full message.
+        """
+        if len(content) <= limit:
+            return [content]
+
+        prefix = "[continued] "
+        prefix_len = len(prefix)
+        chunks = []
+        remaining = content
+        first = True
+        while remaining:
+            effective = limit if first else limit - prefix_len
+            if len(remaining) <= effective:
+                chunks.append(remaining if first else prefix + remaining)
+                break
+
+            segment = remaining[:effective]
+
+            # Try paragraph break, then sentence, then word
+            cut = segment.rfind("\n\n")
+            if cut < effective * 0.3:
+                cut = segment.rfind(". ")
+                if cut >= 0:
+                    cut += 2  # include the period and space
+            if cut < effective * 0.3:
+                cut = segment.rfind(" ")
+            if cut < effective * 0.3:
+                cut = effective  # hard cut
+
+            chunk = remaining[:cut].rstrip()
+            remaining = remaining[cut:].lstrip()
+            if not first:
+                chunk = prefix + chunk
+            chunks.append(chunk)
+            first = False
+
+        return chunks
+
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Record the conversation turn in Honcho (non-blocking)."""
+        """Record the conversation turn in Honcho (non-blocking).
+
+        Messages exceeding the Honcho API limit (default 25k chars) are
+        split into multiple messages with continuation markers.
+        """
         if self._cron_skipped:
             return
         if not self._manager or not self._session_key:
             return
 
+        msg_limit = self._config.message_max_chars if self._config else 25000
+
         def _sync():
             try:
                 session = self._manager.get_or_create(self._session_key)
-                session.add_message("user", user_content[:4000])
-                session.add_message("assistant", assistant_content[:4000])
-                # Flush to Honcho API
+                for chunk in self._chunk_message(user_content, msg_limit):
+                    session.add_message("user", chunk)
+                for chunk in self._chunk_message(assistant_content, msg_limit):
+                    session.add_message("assistant", chunk)
                 self._manager._flush_session(session)
             except Exception as e:
                 logger.debug("Honcho sync_turn failed: %s", e)
@@ -617,15 +639,15 @@ class HonchoMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         """Handle a Honcho tool call, with lazy session init for tools-only mode."""
         if self._cron_skipped:
-            return json.dumps({"error": "Honcho is not active (cron context)."})
+            return tool_error("Honcho is not active (cron context).")
 
         # Port #1957: ensure session is initialized for tools-only mode
         if not self._session_initialized:
             if not self._ensure_session():
-                return json.dumps({"error": "Honcho session could not be initialized."})
+                return tool_error("Honcho session could not be initialized.")
 
         if not self._manager or not self._session_key:
-            return json.dumps({"error": "Honcho is not active for this session."})
+            return tool_error("Honcho is not active for this session.")
 
         try:
             if tool_name == "honcho_profile":
@@ -637,7 +659,7 @@ class HonchoMemoryProvider(MemoryProvider):
             elif tool_name == "honcho_search":
                 query = args.get("query", "")
                 if not query:
-                    return json.dumps({"error": "Missing required parameter: query"})
+                    return tool_error("Missing required parameter: query")
                 max_tokens = min(int(args.get("max_tokens", 800)), 2000)
                 result = self._manager.search_context(
                     self._session_key, query, max_tokens=max_tokens
@@ -649,7 +671,7 @@ class HonchoMemoryProvider(MemoryProvider):
             elif tool_name == "honcho_context":
                 query = args.get("query", "")
                 if not query:
-                    return json.dumps({"error": "Missing required parameter: query"})
+                    return tool_error("Missing required parameter: query")
                 peer = args.get("peer", "user")
                 result = self._manager.dialectic_query(
                     self._session_key, query, peer=peer
@@ -659,17 +681,17 @@ class HonchoMemoryProvider(MemoryProvider):
             elif tool_name == "honcho_conclude":
                 conclusion = args.get("conclusion", "")
                 if not conclusion:
-                    return json.dumps({"error": "Missing required parameter: conclusion"})
+                    return tool_error("Missing required parameter: conclusion")
                 ok = self._manager.create_conclusion(self._session_key, conclusion)
                 if ok:
                     return json.dumps({"result": f"Conclusion saved: {conclusion}"})
-                return json.dumps({"error": "Failed to save conclusion."})
+                return tool_error("Failed to save conclusion.")
 
-            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+            return tool_error(f"Unknown tool: {tool_name}")
 
         except Exception as e:
             logger.error("Honcho tool %s failed: %s", tool_name, e)
-            return json.dumps({"error": f"Honcho {tool_name} failed: {e}"})
+            return tool_error(f"Honcho {tool_name} failed: {e}")
 
     def shutdown(self) -> None:
         for t in (self._prefetch_thread, self._sync_thread):

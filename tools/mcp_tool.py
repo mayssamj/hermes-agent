@@ -792,7 +792,7 @@ class MCPServerTask:
         After the initial ``await`` (list_tools), all mutations are synchronous
         — atomic from the event loop's perspective.
         """
-        from tools.registry import registry
+        from tools.registry import registry, tool_error
         from toolsets import TOOLSETS
 
         async with self._refresh_lock:
@@ -833,6 +833,15 @@ class MCPServerTask:
 
         safe_env = _build_safe_env(user_env)
         command, safe_env = _resolve_stdio_command(command, safe_env)
+
+        # Check package against OSV malware database before spawning
+        from tools.osv_check import check_package_for_malware
+        malware_error = check_package_for_malware(command, args)
+        if malware_error:
+            raise ValueError(
+                f"MCP server '{self.name}': {malware_error}"
+            )
+
         server_params = StdioServerParameters(
             command=command,
             args=args,
@@ -883,7 +892,9 @@ class MCPServerTask:
         if self._auth_type == "oauth":
             try:
                 from tools.mcp_oauth import build_oauth_auth
-                _oauth_auth = build_oauth_auth(self.name, url)
+                _oauth_auth = build_oauth_auth(
+                    self.name, url, config.get("oauth")
+                )
             except Exception as exc:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
                 raise
@@ -1242,7 +1253,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             for block in (result.content or []):
                 if hasattr(block, "text"):
                     parts.append(block.text)
-            return json.dumps({"result": "\n".join(parts) if parts else ""})
+            text_result = "\n".join(parts) if parts else ""
+
+            # Prefer structuredContent (machine-readable JSON) over plain text
+            structured = getattr(result, "structuredContent", None)
+            if structured is not None:
+                return json.dumps({"result": structured})
+            return json.dumps({"result": text_result})
 
         try:
             return _run_on_mcp_loop(_call(), timeout=tool_timeout)
@@ -1306,6 +1323,8 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that reads a resource by URI from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.registry import tool_error
+
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1315,7 +1334,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
 
         uri = args.get("uri")
         if not uri:
-            return json.dumps({"error": "Missing required parameter 'uri'"})
+            return tool_error("Missing required parameter 'uri'")
 
         async def _call():
             result = await server.session.read_resource(uri)
@@ -1395,6 +1414,8 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that gets a prompt by name from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.registry import tool_error
+
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1404,7 +1425,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
 
         name = args.get("name")
         if not name:
-            return json.dumps({"error": "Missing required parameter 'name'"})
+            return tool_error("Missing required parameter 'name'")
         arguments = args.get("arguments", {})
 
         async def _call():
@@ -1713,7 +1734,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     Returns:
         List of registered prefixed tool names.
     """
-    from tools.registry import registry
+    from tools.registry import registry, tool_error
     from toolsets import create_custom_toolset, TOOLSETS
 
     registered_names: List[str] = []
