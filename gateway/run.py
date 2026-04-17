@@ -7891,6 +7891,13 @@ class GatewayRunner:
         (memory provider shutdown, tool resource close) is scheduled
         on a daemon thread so the caller doesn't block on slow teardown
         while holding the cache lock.
+
+        Agents currently in _running_agents are SKIPPED — their clients,
+        terminal sandboxes, background processes, and child subagents
+        are all in active use by the running turn.  Evicting them would
+        tear down those resources mid-turn and crash the request.  If
+        every candidate in the LRU order is active, we simply leave the
+        cache over the cap; it will be re-checked on the next insert.
         """
         _cache = getattr(self, "_agent_cache", None)
         if _cache is None:
@@ -7899,24 +7906,58 @@ class GatewayRunner:
         # arg so skip enforcement if a test fixture swapped the cache type.
         if not hasattr(_cache, "move_to_end"):
             return
-        while len(_cache) > _AGENT_CACHE_MAX_SIZE:
-            try:
-                evicted_key, evicted_entry = _cache.popitem(last=False)
-            except (KeyError, TypeError):
-                break
-            _evicted_agent = None
-            if isinstance(evicted_entry, tuple) and evicted_entry:
-                _evicted_agent = evicted_entry[0]
+
+        # Snapshot of agent instances that are actively mid-turn.  Use id()
+        # so the lookup is O(1) and doesn't depend on AIAgent.__eq__ (which
+        # MagicMock overrides in tests).
+        running_ids = {
+            id(a)
+            for a in getattr(self, "_running_agents", {}).values()
+            if a is not None and a is not _AGENT_PENDING_SENTINEL
+        }
+
+        # Walk LRU → MRU and evict excess-LRU entries that aren't mid-turn.
+        # We only consider entries in the first (size - cap) LRU positions
+        # as eviction candidates.  If one of those slots is held by an
+        # active agent, we SKIP it without compensating by evicting a
+        # newer entry — that would penalise a freshly-inserted session
+        # (which has no cache history to retain) while protecting an
+        # already-cached long-running one.  The cache may therefore stay
+        # temporarily over cap; it will re-check on the next insert,
+        # after active turns have finished.
+        excess = max(0, len(_cache) - _AGENT_CACHE_MAX_SIZE)
+        evict_plan: List[tuple] = []  # [(key, agent), ...]
+        if excess > 0:
+            ordered_keys = list(_cache.keys())
+            for key in ordered_keys[:excess]:
+                entry = _cache.get(key)
+                agent = entry[0] if isinstance(entry, tuple) and entry else None
+                if agent is not None and id(agent) in running_ids:
+                    continue  # active mid-turn; don't evict, don't substitute
+                evict_plan.append((key, agent))
+
+        for key, _ in evict_plan:
+            _cache.pop(key, None)
+
+        remaining_over_cap = len(_cache) - _AGENT_CACHE_MAX_SIZE
+        if remaining_over_cap > 0:
+            logger.warning(
+                "Agent cache over cap (%d > %d); %d excess slot(s) held by "
+                "mid-turn agents — will re-check on next insert.",
+                len(_cache), _AGENT_CACHE_MAX_SIZE, remaining_over_cap,
+            )
+
+        for key, agent in evict_plan:
             logger.info(
                 "Agent cache at cap; evicting LRU session=%s (cache_size=%d)",
-                evicted_key, len(_cache),
+                key, len(_cache),
             )
-            if _evicted_agent is not None:
+            if agent is not None:
                 threading.Thread(
                     target=self._cleanup_agent_resources,
-                    args=(_evicted_agent,),
+                    args=(agent,),
                     daemon=True,
-                    name=f"agent-cache-evict-{evicted_key[:24]}",
+                    name=f"agent-cache-evict-{key[:24]}",
                 ).start()
 
     def _sweep_idle_cached_agents(self) -> int:
@@ -7925,6 +7966,10 @@ class GatewayRunner:
         Safe to call from the session expiry watcher without holding the
         cache lock — acquires it internally.  Returns the number of entries
         evicted.  Resource cleanup is scheduled on daemon threads.
+
+        Agents currently in _running_agents are SKIPPED for the same reason
+        as _enforce_agent_cache_cap: tearing down an active turn's clients
+        mid-flight would crash the request.
         """
         _cache = getattr(self, "_agent_cache", None)
         _lock = getattr(self, "_agent_cache_lock", None)
@@ -7932,11 +7977,18 @@ class GatewayRunner:
             return 0
         now = time.time()
         to_evict: List[tuple] = []
+        running_ids = {
+            id(a)
+            for a in getattr(self, "_running_agents", {}).values()
+            if a is not None and a is not _AGENT_PENDING_SENTINEL
+        }
         with _lock:
             for key, entry in list(_cache.items()):
                 agent = entry[0] if isinstance(entry, tuple) and entry else None
                 if agent is None:
                     continue
+                if id(agent) in running_ids:
+                    continue  # mid-turn — don't tear it down
                 last_activity = getattr(agent, "_last_activity_ts", None)
                 if last_activity is None:
                     continue
