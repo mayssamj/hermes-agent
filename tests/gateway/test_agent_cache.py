@@ -258,3 +258,165 @@ class TestAgentCacheLifecycle:
         cb3 = lambda *a: None
         agent.tool_progress_callback = cb3
         assert agent.tool_progress_callback is cb3
+
+
+class TestAgentCacheBoundedGrowth:
+    """LRU cap and idle-TTL eviction prevent unbounded cache growth."""
+
+    def _bounded_runner(self):
+        """Runner with an OrderedDict cache (matches real gateway init)."""
+        from collections import OrderedDict
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._agent_cache = OrderedDict()
+        runner._agent_cache_lock = threading.Lock()
+        return runner
+
+    def _fake_agent(self, last_activity: float | None = None):
+        """Lightweight stand-in; real AIAgent is heavy to construct."""
+        m = MagicMock()
+        if last_activity is not None:
+            m._last_activity_ts = last_activity
+        else:
+            import time as _t
+            m._last_activity_ts = _t.time()
+        return m
+
+    def test_cap_evicts_lru_when_exceeded(self, monkeypatch):
+        """Inserting past _AGENT_CACHE_MAX_SIZE pops the oldest entry."""
+        from gateway import run as gw_run
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_MAX_SIZE", 3)
+        runner = self._bounded_runner()
+        runner._cleanup_agent_resources = MagicMock()
+
+        for i in range(3):
+            runner._agent_cache[f"s{i}"] = (self._fake_agent(), f"sig{i}")
+
+        # Insert a 4th — oldest (s0) must be evicted.
+        with runner._agent_cache_lock:
+            runner._agent_cache["s3"] = (self._fake_agent(), "sig3")
+            runner._enforce_agent_cache_cap()
+
+        assert "s0" not in runner._agent_cache
+        assert "s3" in runner._agent_cache
+        assert len(runner._agent_cache) == 3
+
+    def test_cap_respects_move_to_end(self, monkeypatch):
+        """Entries refreshed via move_to_end are NOT evicted as 'oldest'."""
+        from gateway import run as gw_run
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_MAX_SIZE", 3)
+        runner = self._bounded_runner()
+        runner._cleanup_agent_resources = MagicMock()
+
+        for i in range(3):
+            runner._agent_cache[f"s{i}"] = (self._fake_agent(), f"sig{i}")
+
+        # Touch s0 — it is now MRU, so s1 becomes LRU.
+        runner._agent_cache.move_to_end("s0")
+
+        with runner._agent_cache_lock:
+            runner._agent_cache["s3"] = (self._fake_agent(), "sig3")
+            runner._enforce_agent_cache_cap()
+
+        assert "s0" in runner._agent_cache  # rescued by move_to_end
+        assert "s1" not in runner._agent_cache  # now oldest → evicted
+        assert "s3" in runner._agent_cache
+
+    def test_cap_triggers_cleanup_thread(self, monkeypatch):
+        """Evicted agent has _cleanup_agent_resources called for it."""
+        from gateway import run as gw_run
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_MAX_SIZE", 1)
+        runner = self._bounded_runner()
+
+        cleanup_calls: list = []
+        runner._cleanup_agent_resources = lambda a: cleanup_calls.append(a)
+
+        old_agent = self._fake_agent()
+        new_agent = self._fake_agent()
+        with runner._agent_cache_lock:
+            runner._agent_cache["old"] = (old_agent, "sig_old")
+            runner._agent_cache["new"] = (new_agent, "sig_new")
+            runner._enforce_agent_cache_cap()
+
+        # Cleanup is dispatched to a daemon thread; join briefly to observe.
+        import time as _t
+        deadline = _t.time() + 2.0
+        while _t.time() < deadline and not cleanup_calls:
+            _t.sleep(0.02)
+        assert old_agent in cleanup_calls
+        assert new_agent not in cleanup_calls
+
+    def test_idle_ttl_sweep_evicts_stale_agents(self, monkeypatch):
+        """_sweep_idle_cached_agents removes agents idle past the TTL."""
+        from gateway import run as gw_run
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_IDLE_TTL_SECS", 0.05)
+        runner = self._bounded_runner()
+        runner._cleanup_agent_resources = MagicMock()
+
+        import time as _t
+        fresh = self._fake_agent(last_activity=_t.time())
+        stale = self._fake_agent(last_activity=_t.time() - 10.0)
+        runner._agent_cache["fresh"] = (fresh, "s1")
+        runner._agent_cache["stale"] = (stale, "s2")
+
+        evicted = runner._sweep_idle_cached_agents()
+        assert evicted == 1
+        assert "stale" not in runner._agent_cache
+        assert "fresh" in runner._agent_cache
+
+    def test_idle_sweep_skips_agents_without_activity_ts(self, monkeypatch):
+        """Agents missing _last_activity_ts are left alone (defensive)."""
+        from gateway import run as gw_run
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_IDLE_TTL_SECS", 0.01)
+        runner = self._bounded_runner()
+        runner._cleanup_agent_resources = MagicMock()
+
+        no_ts = MagicMock(spec=[])  # no _last_activity_ts attribute
+        runner._agent_cache["s"] = (no_ts, "sig")
+
+        assert runner._sweep_idle_cached_agents() == 0
+        assert "s" in runner._agent_cache
+
+    def test_plain_dict_cache_is_tolerated(self):
+        """Test fixtures using plain {} don't crash _enforce_agent_cache_cap."""
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._agent_cache = {}  # plain dict, not OrderedDict
+        runner._agent_cache_lock = threading.Lock()
+        runner._cleanup_agent_resources = MagicMock()
+
+        # Should be a no-op rather than raising.
+        with runner._agent_cache_lock:
+            for i in range(200):
+                runner._agent_cache[f"s{i}"] = (MagicMock(), f"sig{i}")
+            runner._enforce_agent_cache_cap()  # no crash, no eviction
+
+        assert len(runner._agent_cache) == 200
+
+    def test_main_lookup_updates_lru_order(self, monkeypatch):
+        """Cache hit via the main-lookup path refreshes LRU position."""
+        runner = self._bounded_runner()
+
+        a0 = self._fake_agent()
+        a1 = self._fake_agent()
+        a2 = self._fake_agent()
+        runner._agent_cache["s0"] = (a0, "sig0")
+        runner._agent_cache["s1"] = (a1, "sig1")
+        runner._agent_cache["s2"] = (a2, "sig2")
+
+        # Simulate what _process_message_background does on a cache hit
+        # (minus the agent-state reset which isn't relevant here).
+        with runner._agent_cache_lock:
+            cached = runner._agent_cache.get("s0")
+            if cached and hasattr(runner._agent_cache, "move_to_end"):
+                runner._agent_cache.move_to_end("s0")
+
+        # After the hit, insertion order should be s1, s2, s0.
+        assert list(runner._agent_cache.keys()) == ["s1", "s2", "s0"]
