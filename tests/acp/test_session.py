@@ -332,6 +332,75 @@ class TestPersistence:
         assert restored.agent.provider == "anthropic"
         assert restored.agent.base_url == "https://anthropic.example/v1"
 
+    def test_restore_custom_provider_preserves_base_url(self, tmp_path, monkeypatch):
+        """provider="custom" + base_url must survive a save/restore round-trip
+        even when the live config has switched to a different provider.
+
+        Regression for D-028 P4: previously the restore path consulted
+        ``config_provider`` only, so if the live config no longer said
+        ``custom`` the persisted base_url was silently dropped and the agent
+        was rebuilt against the default provider's URL (commonly OpenAI).
+        """
+
+        def fake_resolve_runtime_provider(requested=None, **kwargs):
+            # If this gets called for the restored session we will catch it
+            # via the assertion below — the custom branch should fire instead.
+            return {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.example/v1",
+                "api_key": "openrouter-key",
+                "command": None,
+                "args": [],
+            }
+
+        def fake_agent(**kwargs):
+            return SimpleNamespace(
+                model=kwargs.get("model"),
+                provider=kwargs.get("provider"),
+                base_url=kwargs.get("base_url"),
+                api_mode=kwargs.get("api_mode"),
+            )
+
+        # Initial config: provider=custom + custom base_url. This is what makes
+        # ``create_session`` build the agent with provider="custom" so the
+        # persisted snapshot carries provider="custom" and a custom base_url.
+        live_config = {
+            "model": {
+                "provider": "custom",
+                "default": "test-model",
+                "base_url": "http://litellm.local:4000",
+            }
+        }
+
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: live_config)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        db = SessionDB(tmp_path / "state.db")
+
+        with patch("run_agent.AIAgent", side_effect=fake_agent):
+            manager = SessionManager(db=db)
+            state = manager.create_session(cwd="/work")
+            manager.save_session(state.session_id)
+
+            # Drop from memory so get_session has to restore from DB.
+            with manager._lock:
+                del manager._sessions[state.session_id]
+
+            # Live config flips away from custom. The restored session must
+            # still honour its persisted custom base_url.
+            live_config["model"] = {
+                "provider": "openrouter",
+                "default": "test-model",
+            }
+            restored = manager.get_session(state.session_id)
+
+        assert restored is not None
+        assert restored.agent.provider == "custom"
+        assert restored.agent.base_url == "http://litellm.local:4000"
+
     def test_acp_agents_route_human_output_to_stderr(self, tmp_path, monkeypatch):
         """ACP agents must keep stdout clean for JSON-RPC stdio transport."""
 
