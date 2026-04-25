@@ -455,12 +455,19 @@ class SessionManager:
 
         config_base_url = model_cfg.get("base_url") if isinstance(model_cfg, dict) else None
         config_api_key = model_cfg.get("api_key") if isinstance(model_cfg, dict) else None
-        if config_provider == "custom" and config_base_url:
+
+        # Custom provider takes precedence when EITHER the live config OR the
+        # caller (e.g. session restore) supplies provider="custom". Without this
+        # the restore path falls through to resolve_runtime_provider, which has
+        # no notion of "custom" and silently drops the persisted base_url.
+        effective_provider = requested_provider or config_provider
+        effective_base_url = base_url or config_base_url
+        if effective_provider == "custom" and effective_base_url:
             kwargs.update(
                 {
-                    "provider": config_provider,
+                    "provider": "custom",
                     "api_mode": api_mode or "chat_completions",
-                    "base_url": base_url or config_base_url,
+                    "base_url": effective_base_url,
                     "api_key": os.environ.get("LITELLM_MASTER_KEY", "") if config_api_key and config_api_key.startswith("${") else (config_api_key or ""),
                 }
             )
