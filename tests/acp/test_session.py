@@ -343,6 +343,67 @@ class TestPersistence:
         assert restored.history[0].get("tool_calls") is not None
         assert restored.history[1].get("tool_call_id") == "tc_1"
 
+    def test_restore_custom_provider_preserves_base_url(self, tmp_path, monkeypatch):
+        """provider="custom" + base_url must survive a save/restore round-trip
+        even when the live config has switched to a different provider.
+
+        Regression for D-028 P4: previously the restore path consulted
+        ``config_provider`` only, so if the live config no longer said
+        ``custom`` the persisted base_url was silently dropped and the agent
+        was rebuilt against the default provider's URL (commonly OpenAI).
+        """
+
+        def fake_resolve_runtime_provider(requested=None, **kwargs):
+            return {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.example/v1",
+                "api_key": "openrouter-key",
+                "command": None,
+                "args": [],
+            }
+
+        def fake_agent(**kwargs):
+            return SimpleNamespace(
+                model=kwargs.get("model"),
+                provider=kwargs.get("provider"),
+                base_url=kwargs.get("base_url"),
+                api_mode=kwargs.get("api_mode"),
+            )
+
+        live_config = {
+            "model": {
+                "provider": "custom",
+                "default": "test-model",
+                "base_url": "http://litellm.local:4000",
+            }
+        }
+
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: live_config)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        db = SessionDB(tmp_path / "state.db")
+
+        with patch("run_agent.AIAgent", side_effect=fake_agent):
+            manager = SessionManager(db=db)
+            state = manager.create_session(cwd="/work")
+            manager.save_session(state.session_id)
+
+            with manager._lock:
+                del manager._sessions[state.session_id]
+
+            live_config["model"] = {
+                "provider": "openrouter",
+                "default": "test-model",
+            }
+            restored = manager.get_session(state.session_id)
+
+        assert restored is not None
+        assert restored.agent.provider == "custom"
+        assert restored.agent.base_url == "http://litellm.local:4000"
+
     def test_restore_preserves_persisted_provider_snapshot(self, tmp_path, monkeypatch):
         """Restored ACP sessions should keep their original runtime provider."""
         runtime_choice = {"provider": "anthropic"}
