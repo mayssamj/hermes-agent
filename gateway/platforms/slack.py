@@ -285,12 +285,25 @@ class SlackAdapter(BasePlatformAdapter):
             # Controlled via platform config: gateway.slack.reply_broadcast
             broadcast = self.config.extra.get("reply_broadcast", False)
 
+            # D-121 (Phase 5c): persona+model displayName for Slack sender header.
+            # Sourced from platforms.slack.extra.{username,icon_emoji} in
+            # config.yaml — generator (scripts/generate_routing.py:render_hermes_config)
+            # bakes these from agent_routing.yaml on every --apply. Requires
+            # the Slack app to hold chat:write.customize scope; absent that
+            # scope the override is silently ignored.
+            username = self.config.extra.get("username")
+            icon_emoji = self.config.extra.get("icon_emoji")
+
             for i, chunk in enumerate(chunks):
                 kwargs = {
                     "channel": chat_id,
                     "text": chunk,
                     "mrkdwn": True,
                 }
+                if username:
+                    kwargs["username"] = username
+                if icon_emoji:
+                    kwargs["icon_emoji"] = icon_emoji
                 if thread_ts:
                     kwargs["thread_ts"] = thread_ts
                     # Only broadcast the first chunk of the first reply
